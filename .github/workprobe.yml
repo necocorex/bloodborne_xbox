@@ -1,0 +1,580 @@
+name: Build XboxProbe
+
+# One-file setup: this workflow contains the whole probe project, builds it as a UWP package,
+# signs it with a throw-away test certificate and publishes XboxProbe.appx on the Releases page.
+# Create the file as .github/workflows/probe.yml in an empty repository; it starts by itself.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Write project files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path XboxProbe | Out-Null
+          @'
+          // XboxProbe: capability probe for the "bbport on Xbox Dev Mode" feasibility check.
+          //
+          // Everything it learns goes to results.txt in the app's LocalState folder
+          // (Xbox Device Portal -> File explorer -> LocalAppData -> this app -> LocalState).
+          // The file is flushed after every line, so even if the system kills the app
+          // (for example during the memory test) the last line shows how far it got.
+          //
+          // NOT compiled or run by the author: expect to fix a typo or two on the first build.
+
+          #define NOMINMAX
+          #include <windows.h>
+          #include <memoryapi.h>
+          #include <unknwn.h>
+          #include <d3d12.h>
+          #include <dxgi1_4.h>
+
+          #include <winrt/Windows.Foundation.h>
+          #include <winrt/Windows.ApplicationModel.Core.h>
+          #include <winrt/Windows.UI.Core.h>
+          #include <winrt/Windows.Storage.h>
+          #include <winrt/Windows.System.h>
+
+          #include <atomic>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          #pragma comment(lib, "WindowsApp.lib")
+          #pragma comment(lib, "d3d12.lib")
+          #pragma comment(lib, "dxgi.lib")
+
+          #ifndef MEM_RESERVE_PLACEHOLDER
+          #define MEM_RESERVE_PLACEHOLDER 0x00040000
+          #endif
+          #ifndef MEM_REPLACE_PLACEHOLDER
+          #define MEM_REPLACE_PLACEHOLDER 0x00004000
+          #endif
+          #ifndef MEM_PRESERVE_PLACEHOLDER
+          #define MEM_PRESERVE_PLACEHOLDER 0x00000002
+          #endif
+
+          using winrt::Windows::System::MemoryManager;
+
+          // ---------------------------------------------------------------- logging
+
+          static HANDLE g_log = INVALID_HANDLE_VALUE;
+
+          static void Log(const char* fmt, ...) {
+              char buf[1024];
+              va_list ap;
+              va_start(ap, fmt);
+              int n = vsnprintf(buf, sizeof(buf) - 3, fmt, ap);
+              va_end(ap);
+              if (n < 0) return;
+              if (n > (int)sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+              buf[n++] = '\r';
+              buf[n++] = '\n';
+              buf[n] = 0;
+              OutputDebugStringA(buf);
+              if (g_log != INVALID_HANDLE_VALUE) {
+                  DWORD written = 0;
+                  WriteFile(g_log, buf, (DWORD)n, &written, nullptr);
+                  FlushFileBuffers(g_log);
+              }
+          }
+
+          static void OpenLog() {
+              auto folder = winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path();
+              std::wstring path = std::wstring(folder.c_str()) + L"\\results.txt";
+              CREATEFILE2_EXTENDED_PARAMETERS p{};
+              p.dwSize = sizeof(p);
+              p.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+              g_log = CreateFile2(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS, &p);
+          }
+
+          // ---------------------------------------------------------------- probes
+
+          static void ProbeSystem() {
+              SYSTEM_INFO si{};
+              GetSystemInfo(&si);
+              Log("[system] processors (GetSystemInfo): %lu", si.dwNumberOfProcessors);
+              Log("[system] hardware_concurrency: %u", std::thread::hardware_concurrency());
+              Log("[system] page size %lu, allocation granularity %lu, max app address %p",
+                  si.dwPageSize, si.dwAllocationGranularity, si.lpMaximumApplicationAddress);
+              MEMORYSTATUSEX ms{};
+              ms.dwLength = sizeof(ms);
+              if (GlobalMemoryStatusEx(&ms)) {
+                  Log("[system] phys total %llu MB, phys avail %llu MB", ms.ullTotalPhys >> 20, ms.ullAvailPhys >> 20);
+                  Log("[system] virtual total %llu MB, virtual avail %llu MB", ms.ullTotalVirtual >> 20, ms.ullAvailVirtual >> 20);
+                  Log("[system] commit limit %llu MB, commit avail %llu MB", ms.ullTotalPageFile >> 20, ms.ullAvailPageFile >> 20);
+              }
+          }
+
+          static void ProbeMemoryManager() {
+              try {
+                  Log("[memory] AppMemoryUsageLimit: %llu MB", (unsigned long long)MemoryManager::AppMemoryUsageLimit() >> 20);
+                  Log("[memory] AppMemoryUsage now: %llu MB", (unsigned long long)MemoryManager::AppMemoryUsage() >> 20);
+                  Log("[memory] AppMemoryUsageLevel: %d", (int)MemoryManager::AppMemoryUsageLevel());
+              } catch (winrt::hresult_error const& e) {
+                  Log("[memory] MemoryManager failed: 0x%08lx", (unsigned long)e.code().value);
+              }
+              try {
+                  Log("[memory] ExpectedAppMemoryUsageLimit: %llu MB", (unsigned long long)MemoryManager::ExpectedAppMemoryUsageLimit() >> 20);
+              } catch (winrt::hresult_error const& e) {
+                  Log("[memory] ExpectedAppMemoryUsageLimit unavailable: 0x%08lx", (unsigned long)e.code().value);
+              }
+          }
+
+          static void ProbeThreads() {
+              const unsigned counts[] = {1, 2, 4, 6, 8, 12, 16};
+              unsigned long long base = 0;
+              for (unsigned n : counts) {
+                  std::atomic<unsigned long long> total{0};
+                  std::atomic<bool> go{false}, stop{false};
+                  std::vector<std::thread> threads;
+                  for (unsigned i = 0; i < n; ++i) {
+                      threads.emplace_back([&] {
+                          unsigned long long local = 0;
+                          volatile unsigned x = 1;
+                          while (!go.load()) {}
+                          while (!stop.load()) {
+                              for (int k = 0; k < 10000; ++k) x = x * 1664525u + 1013904223u;
+                              ++local;
+                          }
+                          total += local;
+                      });
+                  }
+                  go = true;
+                  Sleep(500);
+                  stop = true;
+                  for (auto& t : threads) t.join();
+                  if (n == 1) base = total.load();
+                  Log("[cpu] %2u threads: %llu work units in 500 ms (%.2fx of one thread)", n,
+                      (unsigned long long)total.load(), base ? (double)total.load() / (double)base : 0.0);
+              }
+          }
+
+          static void ProbeD3D12() {
+              winrt::com_ptr<IDXGIFactory4> factory;
+              HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), factory.put_void());
+              if (FAILED(hr)) {
+                  Log("[d3d12] CreateDXGIFactory1 failed: 0x%08lx", (unsigned long)hr);
+                  return;
+              }
+              for (UINT i = 0;; ++i) {
+                  winrt::com_ptr<IDXGIAdapter1> adapter;
+                  if (factory->EnumAdapters1(i, adapter.put()) == DXGI_ERROR_NOT_FOUND) break;
+                  DXGI_ADAPTER_DESC1 d{};
+                  adapter->GetDesc1(&d);
+                  Log("[d3d12] adapter %u: %ls, dedicated %llu MB, shared %llu MB, flags 0x%x", i, d.Description,
+                      (unsigned long long)(d.DedicatedVideoMemory >> 20), (unsigned long long)(d.SharedSystemMemory >> 20), d.Flags);
+                  if (auto a3 = adapter.try_as<IDXGIAdapter3>()) {
+                      DXGI_QUERY_VIDEO_MEMORY_INFO vi{};
+                      if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
+                          Log("[d3d12]   local budget %llu MB, usage %llu MB", vi.Budget >> 20, vi.CurrentUsage >> 20);
+                      if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vi)))
+                          Log("[d3d12]   non-local budget %llu MB, usage %llu MB", vi.Budget >> 20, vi.CurrentUsage >> 20);
+                  }
+                  winrt::com_ptr<ID3D12Device> dev;
+                  hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), dev.put_void());
+                  if (FAILED(hr)) {
+                      Log("[d3d12]   D3D12CreateDevice (12_0) failed: 0x%08lx", (unsigned long)hr);
+                      continue;
+                  }
+                  D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
+                  if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))))
+                      Log("[d3d12]   resource binding tier %d, tiled resources tier %d, typed UAV formats %d",
+                          (int)o.ResourceBindingTier, (int)o.TiledResourcesTier, (int)o.TypedUAVLoadAdditionalFormats);
+                  D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1{};
+                  if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))))
+                      Log("[d3d12]   wave ops %d (lanes %u-%u), int64 shader ops %d",
+                          (int)o1.WaveOps, o1.WaveLaneCountMin, o1.WaveLaneCountMax, (int)o1.Int64ShaderOps);
+                  D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4{};
+                  if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4))))
+                      Log("[d3d12]   native 16-bit shader ops %d", (int)o4.Native16BitShaderOpsSupported);
+                  int best = 0;
+                  const int models[] = {0x66, 0x65, 0x64, 0x63, 0x62, 0x61, 0x60};
+                  for (int m : models) {
+                      D3D12_FEATURE_DATA_SHADER_MODEL sm{};
+                      sm.HighestShaderModel = (D3D_SHADER_MODEL)m;
+                      if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+                          best = (int)sm.HighestShaderModel;
+                          break;
+                      }
+                  }
+                  Log("[d3d12]   highest shader model: 0x%x", best);
+              }
+          }
+
+          typedef int (*TestFn)();
+
+          static bool CallCode(void* mem, const char* what) {
+              __try {
+                  int r = ((TestFn)mem)();
+                  Log("[exec] %s: executed, returned %d (expected 42)", what, r);
+                  return r == 42;
+              } __except (EXCEPTION_EXECUTE_HANDLER) {
+                  Log("[exec] %s: exception 0x%08lx while executing", what, (unsigned long)GetExceptionCode());
+                  return false;
+              }
+          }
+
+          static void ProbeExec() {
+              static const unsigned char code[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 42 ; ret
+
+              // 1. plain VirtualAlloc with execute rights (expected to fail inside UWP)
+              void* p = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+              if (!p) {
+                  Log("[exec] VirtualAlloc RWX: failed, error %lu", GetLastError());
+              } else {
+                  memcpy(p, code, sizeof(code));
+                  FlushInstructionCache(GetCurrentProcess(), p, sizeof(code));
+                  Log("[exec] VirtualAlloc RWX: allocated, calling...");
+                  CallCode(p, "VirtualAlloc RWX");
+              }
+
+              // 2. VirtualAllocFromApp with execute rights (needs the codeGeneration capability)
+              p = VirtualAllocFromApp(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+              if (!p) {
+                  Log("[exec] VirtualAllocFromApp RWX: failed, error %lu", GetLastError());
+              } else {
+                  memcpy(p, code, sizeof(code));
+                  FlushInstructionCache(GetCurrentProcess(), p, sizeof(code));
+                  Log("[exec] VirtualAllocFromApp RWX: allocated, calling...");
+                  CallCode(p, "VirtualAllocFromApp RWX");
+              }
+
+              // 3. write first, then flip to execute-only-read (the W^X way)
+              p = VirtualAllocFromApp(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+              if (!p) {
+                  Log("[exec] VirtualAllocFromApp RW: failed, error %lu", GetLastError());
+                  return;
+              }
+              memcpy(p, code, sizeof(code));
+              ULONG old = 0;
+              if (!VirtualProtectFromApp(p, 65536, PAGE_EXECUTE_READ, &old)) {
+                  Log("[exec] VirtualProtectFromApp RW->RX: failed, error %lu", GetLastError());
+                  return;
+              }
+              FlushInstructionCache(GetCurrentProcess(), p, sizeof(code));
+              Log("[exec] VirtualProtectFromApp RW->RX: ok, calling...");
+              CallCode(p, "RW->RX");
+          }
+
+          typedef PVOID(WINAPI* PFN_VirtualAlloc2)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+          typedef PVOID(WINAPI* PFN_MapViewOfFile3)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+          static FARPROC Resolve(const char* name) {
+              const wchar_t* modules[] = {L"kernelbase.dll", L"kernel32.dll"};
+              for (auto m : modules) {
+                  HMODULE h = GetModuleHandleW(m);
+                  if (!h) continue;
+                  FARPROC f = GetProcAddress(h, name);
+                  if (f) return f;
+              }
+              return nullptr;
+          }
+
+          static void ProbePlaceholders() {
+              const char* allocName = "VirtualAlloc2FromApp";
+              auto valloc2 = (PFN_VirtualAlloc2)Resolve(allocName);
+              if (!valloc2) {
+                  allocName = "VirtualAlloc2";
+                  valloc2 = (PFN_VirtualAlloc2)Resolve(allocName);
+              }
+              const char* mapName = "MapViewOfFile3FromApp";
+              auto map3 = (PFN_MapViewOfFile3)Resolve(mapName);
+              if (!map3) {
+                  mapName = "MapViewOfFile3";
+                  map3 = (PFN_MapViewOfFile3)Resolve(mapName);
+              }
+              Log("[placeholder] alloc function: %s", valloc2 ? allocName : "NOT FOUND");
+              Log("[placeholder] map function: %s", map3 ? mapName : "NOT FOUND");
+              if (!valloc2 || !map3) return;
+
+              const SIZE_T total = 1ull << 30, part = 64ull << 20;
+              void* base = valloc2(GetCurrentProcess(), nullptr, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+              if (!base) {
+                  Log("[placeholder] reserve 1 GB placeholder: failed, error %lu", GetLastError());
+                  return;
+              }
+              Log("[placeholder] reserve 1 GB placeholder: ok at %p", base);
+              if (!VirtualFree(base, part, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                  Log("[placeholder] split 64 MB off: failed, error %lu", GetLastError());
+                  return;
+              }
+              Log("[placeholder] split 64 MB off: ok");
+              HANDLE section = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, part, nullptr);
+              if (!section) {
+                  Log("[placeholder] CreateFileMappingFromApp: failed, error %lu", GetLastError());
+                  return;
+              }
+              void* view = map3(section, GetCurrentProcess(), base, 0, part, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+              if (!view) {
+                  Log("[placeholder] map view over placeholder: failed, error %lu", GetLastError());
+                  return;
+              }
+              static_cast<volatile char*>(view)[0] = 1;
+              static_cast<volatile char*>(view)[part - 1] = 2;
+              Log("[placeholder] map view over placeholder: ok, first and last byte writable");
+          }
+
+          static void ProbeReserve() {
+              const unsigned long long sizes[] = {2, 8, 64, 256, 1024};
+              for (unsigned long long gb : sizes) {
+                  void* p = VirtualAlloc(nullptr, (SIZE_T)(gb << 30), MEM_RESERVE, PAGE_NOACCESS);
+                  if (p) {
+                      Log("[reserve] %llu GB of address space: ok", gb);
+                      VirtualFree(p, 0, MEM_RELEASE);
+                  } else {
+                      Log("[reserve] %llu GB of address space: failed, error %lu", gb, GetLastError());
+                  }
+              }
+              void* fixed = VirtualAlloc((void*)0x400000000ull, 256ull << 20, MEM_RESERVE, PAGE_NOACCESS);
+              if (fixed) {
+                  Log("[reserve] fixed address 0x400000000, 256 MB: ok");
+                  VirtualFree(fixed, 0, MEM_RELEASE);
+              } else {
+                  Log("[reserve] fixed address 0x400000000, 256 MB: failed, error %lu", GetLastError());
+              }
+          }
+
+          static void ProbeCommit() {
+              unsigned long long limit = 6ull << 30;
+              try {
+                  limit = MemoryManager::AppMemoryUsageLimit();
+              } catch (...) {
+              }
+              unsigned long long ceiling = limit + (1ull << 30);
+              if (ceiling > (12ull << 30)) ceiling = 12ull << 30;
+              const SIZE_T chunk = 256ull << 20;
+              Log("[commit] touching memory in 256 MB steps up to %llu MB. If the app is killed, the last line is the practical ceiling.",
+                  ceiling >> 20);
+              std::vector<void*> blocks;
+              unsigned long long total = 0;
+              while (total + chunk <= ceiling) {
+                  void* p = VirtualAlloc(nullptr, chunk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                  if (!p) {
+                      Log("[commit] allocation failed at %llu MB (error %lu)", total >> 20, GetLastError());
+                      break;
+                  }
+                  for (SIZE_T o = 0; o < chunk; o += 4096) static_cast<volatile char*>(p)[o] = 1;
+                  blocks.push_back(p);
+                  total += chunk;
+                  unsigned long long usage = 0;
+                  try {
+                      usage = MemoryManager::AppMemoryUsage();
+                  } catch (...) {
+                  }
+                  Log("[commit] %llu MB committed and touched, AppMemoryUsage %llu MB", total >> 20, usage >> 20);
+              }
+              for (void* b : blocks) VirtualFree(b, 0, MEM_RELEASE);
+              Log("[commit] finished, everything released");
+          }
+
+          static void RunProbes() {
+              OpenLog();
+              Log("XboxProbe started");
+              ProbeSystem();
+              ProbeMemoryManager();
+              ProbeThreads();
+              ProbeD3D12();
+              ProbeExec();
+              ProbePlaceholders();
+              ProbeReserve();
+              ProbeCommit();  // last: this one may get the app killed
+              Log("DONE");
+          }
+
+          // ---------------------------------------------------------------- app shell
+
+          using namespace winrt::Windows::ApplicationModel::Core;
+          using namespace winrt::Windows::UI::Core;
+
+          struct App : winrt::implements<App, IFrameworkViewSource, IFrameworkView> {
+              IFrameworkView CreateView() { return *this; }
+              void Initialize(CoreApplicationView const&) {}
+              void Load(winrt::hstring const&) {}
+              void Uninitialize() {}
+              void SetWindow(CoreWindow const&) {}
+              void Run() {
+                  CoreWindow window = CoreWindow::GetForCurrentThread();
+                  window.Activate();
+                  std::thread([] {
+                      winrt::init_apartment();
+                      RunProbes();
+                  }).detach();
+                  window.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessUntilQuit);
+              }
+          };
+
+          int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+              CoreApplication::Run(winrt::make<App>());
+              return 0;
+          }
+          '@ | Set-Content -Path XboxProbe/main.cpp -Encoding ascii
+          @'
+          cmake_minimum_required(VERSION 3.21)
+          project(XboxProbe LANGUAGES CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          # Static CRT: no Microsoft.VCLibs dependency to install on the console.
+          set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+          set(ASSETS
+              Assets/StoreLogo.png
+              Assets/Square44x44Logo.png
+              Assets/Square150x150Logo.png)
+
+          add_executable(XboxProbe WIN32 main.cpp Package.appxmanifest ${ASSETS})
+
+          set_property(SOURCE Package.appxmanifest PROPERTY VS_DEPLOYMENT_CONTENT 1)
+          set_property(SOURCE ${ASSETS} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+          set_property(SOURCE ${ASSETS} PROPERTY VS_DEPLOYMENT_LOCATION "Assets")
+
+          set_target_properties(XboxProbe PROPERTIES
+              VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION "10.0.17763.0")
+
+          target_compile_options(XboxProbe PRIVATE /EHsc /permissive-)
+          target_link_libraries(XboxProbe PRIVATE WindowsApp d3d12 dxgi)
+
+          # Configure from a Windows runner (x64):
+          #   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+          #         -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0
+          #   cmake --build build --config Release
+          # Then sign and package it the same way you do for your other UWP builds.
+          '@ | Set-Content -Path XboxProbe/CMakeLists.txt -Encoding ascii
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Identity/Publisher must match the certificate you sign with (reuse the one from your other UWP builds).
+               If the validator rejects the codeGeneration capability, tell me the exact message. -->
+          <Package
+            xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+            xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+            IgnorableNamespaces="uap">
+
+            <Identity Name="XboxProbe" Publisher="CN=XboxProbe" Version="1.0.0.0" />
+
+            <Properties>
+              <DisplayName>XboxProbe</DisplayName>
+              <PublisherDisplayName>local</PublisherDisplayName>
+              <Logo>Assets\StoreLogo.png</Logo>
+            </Properties>
+
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+            </Dependencies>
+
+            <Resources>
+              <Resource Language="en-us" />
+            </Resources>
+
+            <Applications>
+              <Application Id="App" Executable="XboxProbe.exe" EntryPoint="App">
+                <uap:VisualElements
+                  DisplayName="XboxProbe"
+                  Description="Capability probe"
+                  BackgroundColor="#202020"
+                  Square150x150Logo="Assets\Square150x150Logo.png"
+                  Square44x44Logo="Assets\Square44x44Logo.png" />
+              </Application>
+            </Applications>
+
+            <Capabilities>
+              <Capability Name="codeGeneration" />
+            </Capabilities>
+          </Package>
+          '@ | Set-Content -Path XboxProbe/Package.appxmanifest -Encoding ascii
+          @'
+          """Writes plain-colour placeholder logos into ./Assets (needed by the UWP manifest).
+          Run once: python make_assets.py   (no third-party packages)"""
+          import os
+          import struct
+          import zlib
+
+
+          def write_png(path, w, h, rgba=(32, 96, 160, 255)):
+              raw = b"".join(b"\x00" + bytes(rgba) * w for _ in range(h))
+
+              def chunk(tag, data):
+                  body = tag + data
+                  return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+              png = (
+                  b"\x89PNG\r\n\x1a\n"
+                  + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                  + chunk(b"IDAT", zlib.compress(raw, 9))
+                  + chunk(b"IEND", b"")
+              )
+              with open(path, "wb") as f:
+                  f.write(png)
+
+
+          os.makedirs("Assets", exist_ok=True)
+          write_png("Assets/StoreLogo.png", 50, 50)
+          write_png("Assets/Square44x44Logo.png", 44, 44)
+          write_png("Assets/Square150x150Logo.png", 150, 150)
+          print("assets written")
+          '@ | Set-Content -Path XboxProbe/make_assets.py -Encoding ascii
+
+      - name: Generate placeholder logos
+        shell: pwsh
+        run: |
+          Push-Location XboxProbe
+          python make_assets.py
+          Pop-Location
+
+      - name: Configure (UWP, x64)
+        shell: pwsh
+        run: |
+          cmake -S XboxProbe -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release
+
+      - name: Assemble package folder
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build -Recurse -Filter XboxProbe.exe | Where-Object { $_.FullName -notmatch 'CMakeFiles|\.dir' } | Select-Object -First 1
+          if (-not $exe) { throw 'XboxProbe.exe not found after build' }
+          Write-Host "Using $($exe.FullName)"
+          New-Item -ItemType Directory -Force -Path pkg/Assets | Out-Null
+          Copy-Item $exe.FullName pkg/XboxProbe.exe
+          Copy-Item XboxProbe/Package.appxmanifest pkg/AppxManifest.xml
+          Copy-Item XboxProbe/Assets/*.png pkg/Assets/
+          Get-ChildItem pkg -Recurse | Select-Object FullName, Length
+
+      - name: Create test signing certificate
+        shell: powershell
+        run: |
+          $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=XboxProbe' -KeyUsage DigitalSignature -FriendlyName 'XboxProbe' -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+          $pwd = ConvertTo-SecureString -String 'probe' -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath probe.pfx -Password $pwd | Out-Null
+          Export-Certificate -Cert $cert -FilePath XboxProbe.cer | Out-Null
+
+      - name: Pack and sign
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory | Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          $makeappx = Join-Path $bin.FullName 'x64\makeappx.exe'
+          $signtool = Join-Path $bin.FullName 'x64\signtool.exe'
+          & $makeappx pack /d pkg /p XboxProbe.appx /o
+          if ($LASTEXITCODE -ne 0) { throw 'makeappx failed' }
+          & $signtool sign /fd SHA256 /f probe.pfx /p probe XboxProbe.appx
+          if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "probe-$env:GITHUB_RUN_NUMBER" XboxProbe.appx XboxProbe.cer --title "XboxProbe build $env:GITHUB_RUN_NUMBER" --notes "UWP capability probe. Install XboxProbe.appx through Xbox Device Portal." --target $env:GITHUB_SHA
