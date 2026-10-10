@@ -1,0 +1,39 @@
+name: xbox-probe-deep
+
+on:
+  push:
+    paths: ['xbox-probe/**', '.github/workflows/xbox-probe.yml']
+  workflow_dispatch:
+
+jobs:
+  build-msix:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v2
+
+      - name: Restore
+        run: nuget restore xbox-probe/XboxProbe.sln
+
+      - name: Build (Release, x64)
+        run: |
+          msbuild xbox-probe/XboxProbe/XboxProbe.csproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:AppxBundle=Always `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:AppxPackageSigningEnabled=true `
+            /p:PackageCertificateKeyFile=xbox-probe\XboxProbe_TemporaryKey.pfx `
+            /p:AppxPackageDir=${{ github.workspace }}\artifacts\
+
+      - name: Upload .msix
+        uses: actions/upload-artifact@v4
+        with:
+          name: XboxProbe-msix
+          path: artifacts/**/*.msix*
+          retention-days: 30
