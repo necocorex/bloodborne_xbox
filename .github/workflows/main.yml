@@ -2,7 +2,7 @@ name: Build XboxProbe
 
 # One-file setup: this workflow contains the whole probe project, builds it as a UWP package,
 # signs it with a throw-away test certificate and publishes XboxProbe.appx on the Releases page.
-# Create the file as .github/workflows/probe.yml in an empty repository; it starts by itself.
+# Errors are copied into annotations so they are readable without opening the step logs.
 
 on:
   push:
@@ -531,21 +531,62 @@ jobs:
           python make_assets.py
           Pop-Location
 
+      - name: Diagnose toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $lines = @()
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $lines += "VS: $vs"
+          $lines += "cmake: " + ((cmake --version) | Select-Object -First 1)
+          $ws = Join-Path $vs 'MSBuild\Microsoft\VC\v170\Application Type\Windows Store'
+          $lines += "Windows Store app type present: " + (Test-Path $ws)
+          if (Test-Path $ws) { $lines += "  versions: " + ((Get-ChildItem $ws -Directory).Name -join ', ') }
+          $sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | Where-Object { $_.Name -match '^10\.' } | ForEach-Object { $_.Name }
+          $lines += "Windows SDKs: " + ($sdk -join ', ')
+          $msvc = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | ForEach-Object { $_.Name + ' store-libs-x64=' + (Test-Path "$($_.FullName)\lib\x64\store") }
+          $lines += "MSVC: " + ($msvc -join '; ')
+          $text = (($lines | ForEach-Object { $_ -replace '%','%25' }) -join '%0A')
+          Write-Host "::notice title=Toolchain::$text"
+          exit 0
+
       - name: Configure (UWP, x64)
         shell: pwsh
         run: |
-          cmake -S XboxProbe -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+            & $Cmd *> $Log
+            $code = $LASTEXITCODE
+            Get-Content $Log | Write-Host
+            if ($code -ne 0) {
+              $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
+              if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              Write-Host "::error title=$Title::$tail"
+              exit 1
+            }
+          }
+          Run-Logged 'CMake configure failed' cmake.log { cmake -S XboxProbe -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 }
 
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config Release
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+            & $Cmd *> $Log
+            $code = $LASTEXITCODE
+            Get-Content $Log | Write-Host
+            if ($code -ne 0) {
+              $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
+              if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              Write-Host "::error title=$Title::$tail"
+              exit 1
+            }
+          }
+          Run-Logged 'Build failed' build.log { cmake --build build --config Release }
 
       - name: Assemble package folder
         shell: pwsh
         run: |
           $exe = Get-ChildItem build -Recurse -Filter XboxProbe.exe | Where-Object { $_.FullName -notmatch 'CMakeFiles|\.dir' } | Select-Object -First 1
-          if (-not $exe) { throw 'XboxProbe.exe not found after build' }
+          if (-not $exe) { Write-Host '::error title=Package::XboxProbe.exe not found after build'; exit 1 }
           Write-Host "Using $($exe.FullName)"
           New-Item -ItemType Directory -Force -Path pkg/Assets | Out-Null
           Copy-Item $exe.FullName pkg/XboxProbe.exe
@@ -556,25 +597,51 @@ jobs:
       - name: Create test signing certificate
         shell: powershell
         run: |
-          $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=XboxProbe' -KeyUsage DigitalSignature -FriendlyName 'XboxProbe' -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
-          $pwd = ConvertTo-SecureString -String 'probe' -Force -AsPlainText
-          Export-PfxCertificate -Cert $cert -FilePath probe.pfx -Password $pwd | Out-Null
-          Export-Certificate -Cert $cert -FilePath XboxProbe.cer | Out-Null
+          try {
+            $ErrorActionPreference = 'Stop'
+            $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=XboxProbe' -KeyUsage DigitalSignature -FriendlyName 'XboxProbe' -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+            $pwd = ConvertTo-SecureString -String 'probe' -Force -AsPlainText
+            Export-PfxCertificate -Cert $cert -FilePath probe.pfx -Password $pwd | Out-Null
+            Export-Certificate -Cert $cert -FilePath XboxProbe.cer | Out-Null
+          } catch {
+            Write-Host "::error title=Certificate failed::$($_.Exception.Message)"
+            exit 1
+          }
 
       - name: Pack and sign
         shell: pwsh
         run: |
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+            & $Cmd *> $Log
+            $code = $LASTEXITCODE
+            Get-Content $Log | Write-Host
+            if ($code -ne 0) {
+              $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
+              if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              Write-Host "::error title=$Title::$tail"
+              exit 1
+            }
+          }
           $bin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory | Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
           $makeappx = Join-Path $bin.FullName 'x64\makeappx.exe'
           $signtool = Join-Path $bin.FullName 'x64\signtool.exe'
-          & $makeappx pack /d pkg /p XboxProbe.appx /o
-          if ($LASTEXITCODE -ne 0) { throw 'makeappx failed' }
-          & $signtool sign /fd SHA256 /f probe.pfx /p probe XboxProbe.appx
-          if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
+          Run-Logged 'makeappx failed' makeappx.log { & $makeappx pack /d pkg /p XboxProbe.appx /o }
+          Run-Logged 'signtool failed' signtool.log { & $signtool sign /fd SHA256 /f probe.pfx /p probe XboxProbe.appx }
 
       - name: Publish release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "probe-$env:GITHUB_RUN_NUMBER" XboxProbe.appx XboxProbe.cer --title "XboxProbe build $env:GITHUB_RUN_NUMBER" --notes "UWP capability probe. Install XboxProbe.appx through Xbox Device Portal." --target $env:GITHUB_SHA
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+            & $Cmd *> $Log
+            $code = $LASTEXITCODE
+            Get-Content $Log | Write-Host
+            if ($code -ne 0) {
+              $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
+              if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              Write-Host "::error title=$Title::$tail"
+              exit 1
+            }
+          }
+          Run-Logged 'Release failed' gh.log { gh release create "probe-$env:GITHUB_RUN_NUMBER" XboxProbe.appx XboxProbe.cer --title "XboxProbe build $env:GITHUB_RUN_NUMBER" --notes "UWP capability probe. Install XboxProbe.appx through Xbox Device Portal." --target $env:GITHUB_SHA }
