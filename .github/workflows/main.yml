@@ -33,6 +33,7 @@ jobs:
           #include <windows.h>
           #include <memoryapi.h>
           #include <unknwn.h>
+          #include <d3d11.h>
           #include <d3d12.h>
           #include <dxgi1_4.h>
 
@@ -50,6 +51,7 @@ jobs:
           #include <vector>
 
           #pragma comment(lib, "WindowsApp.lib")
+          #pragma comment(lib, "d3d11.lib")
           #pragma comment(lib, "d3d12.lib")
           #pragma comment(lib, "dxgi.lib")
 
@@ -159,6 +161,18 @@ jobs:
               }
           }
 
+          static winrt::com_ptr<ID3D12Device> g_hwDevice;
+          static winrt::com_ptr<IDXGIAdapter3> g_hwAdapter3;
+
+          static void LogVideoMemory(const char* tag, IDXGIAdapter3* a3) {
+              if (!a3) return;
+              DXGI_QUERY_VIDEO_MEMORY_INFO vi{};
+              if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
+                  Log("%s local budget %llu MB, usage %llu MB", tag, (unsigned long long)(vi.Budget >> 20), (unsigned long long)(vi.CurrentUsage >> 20));
+              if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vi)))
+                  Log("%s non-local budget %llu MB, usage %llu MB", tag, (unsigned long long)(vi.Budget >> 20), (unsigned long long)(vi.CurrentUsage >> 20));
+          }
+
           static void ProbeD3D12() {
               winrt::com_ptr<IDXGIFactory4> factory;
               HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), factory.put_void());
@@ -173,19 +187,27 @@ jobs:
                   adapter->GetDesc1(&d);
                   Log("[d3d12] adapter %u: %ls, dedicated %llu MB, shared %llu MB, flags 0x%x", i, d.Description,
                       (unsigned long long)(d.DedicatedVideoMemory >> 20), (unsigned long long)(d.SharedSystemMemory >> 20), d.Flags);
-                  if (auto a3 = adapter.try_as<IDXGIAdapter3>()) {
-                      DXGI_QUERY_VIDEO_MEMORY_INFO vi{};
-                      if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
-                          Log("[d3d12]   local budget %llu MB, usage %llu MB", vi.Budget >> 20, vi.CurrentUsage >> 20);
-                      if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vi)))
-                          Log("[d3d12]   non-local budget %llu MB, usage %llu MB", vi.Budget >> 20, vi.CurrentUsage >> 20);
-                  }
-                  winrt::com_ptr<ID3D12Device> dev;
-                  hr = D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), dev.put_void());
-                  if (FAILED(hr)) {
-                      Log("[d3d12]   D3D12CreateDevice (12_0) failed: 0x%08lx", (unsigned long)hr);
+                  winrt::com_ptr<IDXGIAdapter3> a3 = adapter.try_as<IDXGIAdapter3>();
+                  LogVideoMemory("[d3d12]  ", a3.get());
+                  if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                      Log("[d3d12]   software adapter, skipped");
                       continue;
                   }
+                  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+                                                      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
+                  winrt::com_ptr<ID3D12Device> dev;
+                  for (auto lvl : levels) {
+                      winrt::com_ptr<ID3D12Device> t;
+                      HRESULT h = D3D12CreateDevice(adapter.get(), lvl, __uuidof(ID3D12Device), t.put_void());
+                      Log("[d3d12]   CreateDevice, minimum feature level 0x%x: 0x%08lx", (int)lvl, (unsigned long)h);
+                      if (SUCCEEDED(h)) dev = t;
+                  }
+                  if (!dev) {
+                      Log("[d3d12]   no D3D12 device could be created on this adapter");
+                      continue;
+                  }
+                  g_hwDevice = dev;
+                  g_hwAdapter3 = a3;
                   D3D12_FEATURE_DATA_D3D12_OPTIONS o{};
                   if (SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))))
                       Log("[d3d12]   resource binding tier %d, tiled resources tier %d, typed UAV formats %d",
@@ -209,6 +231,93 @@ jobs:
                   }
                   Log("[d3d12]   highest shader model: 0x%x", best);
               }
+          }
+
+          static void ProbeD3D11() {
+              const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+              winrt::com_ptr<ID3D11Device> dev;
+              D3D_FEATURE_LEVEL got{};
+              HRESULT h = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION, dev.put(), &got, nullptr);
+              Log("[d3d11] hardware device: 0x%08lx, feature level 0x%x", (unsigned long)h, (int)got);
+          }
+
+          static void ProbeGpuMemory() {
+              if (!g_hwDevice) {
+                  Log("[gpu] no hardware D3D12 device, GPU memory test skipped");
+                  return;
+              }
+              D3D12_HEAP_PROPERTIES hp{};
+              hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+              D3D12_RESOURCE_DESC rd{};
+              rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+              rd.Width = 256ull << 20;
+              rd.Height = 1;
+              rd.DepthOrArraySize = 1;
+              rd.MipLevels = 1;
+              rd.Format = DXGI_FORMAT_UNKNOWN;
+              rd.SampleDesc.Count = 1;
+              rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+              std::vector<winrt::com_ptr<ID3D12Resource>> bufs;
+              unsigned long long total = 0;
+              Log("[gpu] creating 256 MB default-heap buffers, up to 2 GB; watch whether AppMemoryUsage grows");
+              for (int i = 0; i < 8; ++i) {
+                  winrt::com_ptr<ID3D12Resource> r;
+                  HRESULT h = g_hwDevice->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  __uuidof(ID3D12Resource), r.put_void());
+                  if (FAILED(h)) {
+                      Log("[gpu] CreateCommittedResource failed at %llu MB: 0x%08lx", total >> 20, (unsigned long)h);
+                      break;
+                  }
+                  bufs.push_back(r);
+                  total += rd.Width;
+                  unsigned long long usage = 0;
+                  try {
+                      usage = MemoryManager::AppMemoryUsage();
+                  } catch (...) {
+                  }
+                  Log("[gpu] %llu MB of GPU buffers created, AppMemoryUsage %llu MB", total >> 20, usage >> 20);
+                  LogVideoMemory("[gpu]  ", g_hwAdapter3.get());
+              }
+              bufs.clear();
+              Log("[gpu] released");
+          }
+
+          static volatile LONG g_faults = 0;
+          static void* g_faultPage = nullptr;
+
+          static LONG CALLBACK FaultHandler(PEXCEPTION_POINTERS ep) {
+              if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
+                  ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+                  char* addr = (char*)ep->ExceptionRecord->ExceptionInformation[1];
+                  if (addr >= (char*)g_faultPage && addr < (char*)g_faultPage + 65536) {
+                      ULONG old = 0;
+                      VirtualProtectFromApp(g_faultPage, 65536, PAGE_READWRITE, &old);
+                      InterlockedIncrement(&g_faults);
+                      return EXCEPTION_CONTINUE_EXECUTION;
+                  }
+              }
+              return EXCEPTION_CONTINUE_SEARCH;
+          }
+
+          // Can we catch a write to a protected page and carry on? (needed for guest-memory write tracking)
+          static void ProbeFault() {
+              g_faultPage = VirtualAllocFromApp(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+              if (!g_faultPage) {
+                  Log("[fault] allocation failed, error %lu", GetLastError());
+                  return;
+              }
+              PVOID h = AddVectoredExceptionHandler(1, FaultHandler);
+              Log("[fault] AddVectoredExceptionHandler: %s", h ? "ok" : "failed");
+              if (!h) return;
+              ULONG old = 0;
+              if (!VirtualProtectFromApp(g_faultPage, 65536, PAGE_READONLY, &old)) {
+                  Log("[fault] making the page read-only failed, error %lu", GetLastError());
+                  return;
+              }
+              Log("[fault] writing to a read-only page now (if the app dies here, handlers do not work)");
+              static_cast<volatile char*>(g_faultPage)[100] = 7;
+              Log("[fault] handler ran %ld time(s), value is now %d", (long)g_faults, (int)static_cast<volatile char*>(g_faultPage)[100]);
+              RemoveVectoredExceptionHandler(h);
           }
 
           typedef int (*TestFn)();
@@ -344,50 +453,18 @@ jobs:
               }
           }
 
-          static void ProbeCommit() {
-              unsigned long long limit = 6ull << 30;
-              try {
-                  limit = MemoryManager::AppMemoryUsageLimit();
-              } catch (...) {
-              }
-              unsigned long long ceiling = limit + (1ull << 30);
-              if (ceiling > (12ull << 30)) ceiling = 12ull << 30;
-              const SIZE_T chunk = 256ull << 20;
-              Log("[commit] touching memory in 256 MB steps up to %llu MB. If the app is killed, the last line is the practical ceiling.",
-                  ceiling >> 20);
-              std::vector<void*> blocks;
-              unsigned long long total = 0;
-              while (total + chunk <= ceiling) {
-                  void* p = VirtualAlloc(nullptr, chunk, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-                  if (!p) {
-                      Log("[commit] allocation failed at %llu MB (error %lu)", total >> 20, GetLastError());
-                      break;
-                  }
-                  for (SIZE_T o = 0; o < chunk; o += 4096) static_cast<volatile char*>(p)[o] = 1;
-                  blocks.push_back(p);
-                  total += chunk;
-                  unsigned long long usage = 0;
-                  try {
-                      usage = MemoryManager::AppMemoryUsage();
-                  } catch (...) {
-                  }
-                  Log("[commit] %llu MB committed and touched, AppMemoryUsage %llu MB", total >> 20, usage >> 20);
-              }
-              for (void* b : blocks) VirtualFree(b, 0, MEM_RELEASE);
-              Log("[commit] finished, everything released");
-          }
-
           static void RunProbes() {
               OpenLog();
-              Log("XboxProbe started");
+              Log("XboxProbe v2 started");
               ProbeSystem();
               ProbeMemoryManager();
-              ProbeThreads();
               ProbeD3D12();
+              ProbeD3D11();
               ProbeExec();
               ProbePlaceholders();
               ProbeReserve();
-              ProbeCommit();  // last: this one may get the app killed
+              ProbeGpuMemory();
+              ProbeFault();  // last: this one may kill the app if exception handlers are not allowed
               Log("DONE");
           }
 
@@ -440,7 +517,7 @@ jobs:
               VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION "10.0.17763.0")
 
           target_compile_options(XboxProbe PRIVATE /EHsc /permissive-)
-          target_link_libraries(XboxProbe PRIVATE WindowsApp d3d12 dxgi)
+          target_link_libraries(XboxProbe PRIVATE WindowsApp d3d11 d3d12 dxgi)
 
           # Configure from a Windows runner (x64):
           #   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
