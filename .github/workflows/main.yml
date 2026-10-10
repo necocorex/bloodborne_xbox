@@ -446,10 +446,9 @@ jobs:
           target_link_libraries(XboxProbe PRIVATE WindowsApp d3d12 dxgi)
 
           # Configure from a Windows runner (x64):
-          #   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-          #         -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0
-          #   cmake --build build --config Release
-          # Then sign and package it the same way you do for your other UWP builds.
+          #  cmake -S XboxProbe -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_SYSTEM_NAME=WindowsStore" "-DCMAKE_SYSTEM_VERSION=10.0" 
+          #  cmake --build build --config Release
+          #  Then sign and package it the same way you do for your other UWP builds.
           '@ | Set-Content -Path XboxProbe/CMakeLists.txt -Encoding ascii
           @'
           <?xml version="1.0" encoding="utf-8"?>
