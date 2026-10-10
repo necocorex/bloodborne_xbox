@@ -425,9 +425,6 @@ jobs:
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-          # Static CRT: no Microsoft.VCLibs dependency to install on the console.
-          set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
           set(ASSETS
               Assets/StoreLogo.png
               Assets/Square44x44Logo.png
@@ -470,6 +467,7 @@ jobs:
 
             <Dependencies>
               <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+              <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.24217.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
             </Dependencies>
 
             <Resources>
@@ -644,4 +642,7 @@ jobs:
               exit 1
             }
           }
-          Run-Logged 'Release failed' gh.log { gh release create "probe-$env:GITHUB_RUN_NUMBER" XboxProbe.appx XboxProbe.cer --title "XboxProbe build $env:GITHUB_RUN_NUMBER" --notes "UWP capability probe. Install XboxProbe.appx through Xbox Device Portal." --target $env:GITHUB_SHA }
+          $assets = @('XboxProbe.appx', 'XboxProbe.cer')
+          $vclibs = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs\14.0\Appx\Retail\x64" -Filter 'Microsoft.VCLibs.x64.14.00.appx' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vclibs) { Copy-Item $vclibs.FullName . ; $assets += 'Microsoft.VCLibs.x64.14.00.appx' } else { Write-Host '::warning title=VCLibs::Microsoft.VCLibs.x64.14.00.appx was not found on the runner' }
+          Run-Logged 'Release failed' gh.log { gh release create "probe-$env:GITHUB_RUN_NUMBER" $assets --title "XboxProbe build $env:GITHUB_RUN_NUMBER" --notes "UWP capability probe. Install XboxProbe.appx through Xbox Device Portal and add Microsoft.VCLibs.x64.14.00.appx as a dependency." --target $env:GITHUB_SHA }
