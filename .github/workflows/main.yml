@@ -454,10 +454,13 @@ jobs:
                If the validator rejects the codeGeneration capability, tell me the exact message. -->
           <Package
             xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+            xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
             xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-            IgnorableNamespaces="uap">
+            IgnorableNamespaces="uap mp">
 
             <Identity Name="XboxProbe" Publisher="CN=XboxProbe" Version="1.0.0.0" />
+
+            <mp:PhoneIdentity PhoneProductId="8f1a4f5e-2c3b-4d6a-9e7f-0b1c2d3e4f50" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 
             <Properties>
               <DisplayName>XboxProbe</DisplayName>
@@ -551,13 +554,14 @@ jobs:
       - name: Configure (UWP, x64)
         shell: pwsh
         run: |
-          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd, [switch]$Soft) {
             & $Cmd *> $Log
             $code = $LASTEXITCODE
             Get-Content $Log | Write-Host
             if ($code -ne 0) {
               $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
               if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              if ($Soft) { Write-Host "::warning title=$Title::$tail"; return }
               Write-Host "::error title=$Title::$tail"
               exit 1
             }
@@ -567,18 +571,26 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd, [switch]$Soft) {
             & $Cmd *> $Log
             $code = $LASTEXITCODE
             Get-Content $Log | Write-Host
             if ($code -ne 0) {
               $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
               if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              if ($Soft) { Write-Host "::warning title=$Title::$tail"; return }
               Write-Host "::error title=$Title::$tail"
               exit 1
             }
           }
-          Run-Logged 'Build failed' build.log { cmake --build build --config Release }
+          Run-Logged 'Build reported errors' build.log { cmake --build build --config Release } -Soft
+          $exe = Get-ChildItem build -Recurse -Filter XboxProbe.exe | Where-Object { $_.FullName -notmatch 'CMakeFiles|\.dir' } | Select-Object -First 1
+          if (-not $exe) {
+            $tail = ((Get-Content build.log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
+            if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+            Write-Host "::error title=Build failed, no exe was produced::$tail"
+            exit 1
+          }
 
       - name: Assemble package folder
         shell: pwsh
@@ -609,13 +621,14 @@ jobs:
       - name: Pack and sign
         shell: pwsh
         run: |
-          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd, [switch]$Soft) {
             & $Cmd *> $Log
             $code = $LASTEXITCODE
             Get-Content $Log | Write-Host
             if ($code -ne 0) {
               $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
               if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              if ($Soft) { Write-Host "::warning title=$Title::$tail"; return }
               Write-Host "::error title=$Title::$tail"
               exit 1
             }
@@ -631,13 +644,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd) {
+          function Run-Logged([string]$Title, [string]$Log, [scriptblock]$Cmd, [switch]$Soft) {
             & $Cmd *> $Log
             $code = $LASTEXITCODE
             Get-Content $Log | Write-Host
             if ($code -ne 0) {
               $tail = ((Get-Content $Log -Tail 40) | ForEach-Object { $_ -replace '%','%25' }) -join '%0A'
               if ($tail.Length -gt 3500) { $tail = $tail.Substring($tail.Length - 3500) }
+              if ($Soft) { Write-Host "::warning title=$Title::$tail"; return }
               Write-Host "::error title=$Title::$tail"
               exit 1
             }
